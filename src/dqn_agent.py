@@ -378,15 +378,23 @@ def greedy_eval(agent: "DQNAgent", seed: int = 0) -> dict:
         agent.greedy = was_greedy
 
 
-def train(n_episodes: int = N_EPISODES, seed: int = SEED, eval_every: int = EVAL_EVERY) -> tuple[DQNAgent, pd.DataFrame]:
-    env = ClusterSchedulingEnv()  # tick=1.0 by default, core reward by default
+def train(n_episodes: int = N_EPISODES, seed: int = SEED, eval_every: int = EVAL_EVERY,
+         reward_fn=None) -> tuple[DQNAgent, pd.DataFrame]:
+    """
+    reward_fn: passed straight through to ClusterSchedulingEnv(reward_fn=...). None (the
+    default) reproduces the exact prior behaviour - the environment's own default is
+    default_reward. Pass e.g. environment.freshness_bonus_reward to train under a different
+    reward variant; see multiseed_study.py --reward.
+    """
+    env = ClusterSchedulingEnv(reward_fn=reward_fn)  # tick=1.0 by default, core reward by default
     agent = DQNAgent(env.observation_space.shape[0], env.action_space.n, seed=seed)
     log = TrainingLog()
     eval_rows: list[dict] = []
     best = {"score": float("inf"), "episode": None, "weights": None, "metrics": None}
 
+    reward_name = reward_fn.__name__ if reward_fn is not None else "default_reward"
     print(f"Environment : {env.n_jobs:,} jobs ({env.n_gold_total:,} Gold), "
-          f"{env.n_machines} machines, tick={env.scheduling_tick}")
+          f"{env.n_machines} machines, tick={env.scheduling_tick}, reward={reward_name}")
     print(f"Network     : {env.observation_space.shape[0]} -> {HIDDEN} -> {env.action_space.n}")
     print(f"Training    : {n_episodes} episodes\n")
     print(f"{'ep':>3s} {'steps':>7s} {'reward':>10s} {'R_gold':>9s} {'R_bronze':>9s} "
@@ -505,15 +513,22 @@ def train(n_episodes: int = N_EPISODES, seed: int = SEED, eval_every: int = EVAL
 # EVALUATION
 # ----------------------------------------------------------------------------------
 
-def evaluate(agent: DQNAgent, seed: int = 0) -> pd.DataFrame:
-    """Greedy DQN against all four baselines on the same full environment."""
+def evaluate(agent: DQNAgent, seed: int = 0, reward_fn=None) -> pd.DataFrame:
+    """
+    Greedy DQN against all four baselines on the same full environment.
+
+    reward_fn only affects the logged total_reward column, for consistency with whatever
+    reward the agent was trained under - it has no effect on gold_avg_scheduling_delay,
+    late_gold_avg_delay or bronze_avg_waiting_time, which come from episode_metrics() and
+    depend only on job placement, not on reward.
+    """
     agent.greedy = True
     rows = []
 
     policies = [FCFSScheduler(), RoundRobinScheduler(), StaticPriorityScheduler(),
                 ResourceReservationScheduler(), agent]
     for policy in policies:
-        env = ClusterSchedulingEnv()
+        env = ClusterSchedulingEnv(reward_fn=reward_fn)
         m = run_episode(env, policy, seed=seed)
         m["late_gold_avg_delay"] = late_gold_delay(env)
         late = [j for j in env.jobs if j.is_gold and j.arrival_time > 0]
