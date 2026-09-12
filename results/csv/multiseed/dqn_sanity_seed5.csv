@@ -1,0 +1,4 @@
+seed,check,passed,detail
+5,DQN never selects a masked-out action,True,"0 illegal actions in 20,000 steps"
+5,Greedy policy is deterministic,True,939.053525 vs 939.053525
+5,Q-values are finite,True,range -0.432..-0.249

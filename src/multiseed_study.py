@@ -26,16 +26,35 @@ every output into its own subdirectory, results/csv/multiseed/<reward>/ and
 models/<reward>/, so it can NEVER collide with or overwrite Step 1's default-reward files,
 which remain exactly where they are at the top level of results/csv/multiseed/.
 
+STEP 3 - ACCUMULATING AGGREGATE STATS ACROSS SEPARATE INVOCATIONS. The aggregate table
+(multiseed_aggregate_stats.csv) and the per-seed summary (multiseed_per_seed_summary.csv)
+are DERIVED files, rebuilt on every run from every dqn_evaluation_seed*.csv actually present
+in out_dir - not from the in-memory results of just the seeds passed via --seeds this time.
+This is what makes `python3 src/multiseed_study.py --seeds 5 6 7 8 9` correctly EXTEND a
+prior 5-seed aggregate to 10 seeds instead of silently replacing it with only the 5 just
+trained (the per-seed files like dqn_evaluation_seed0.csv were always safe, since those use
+seed-specific filenames and are never touched by a later seed's run - only the aggregate was
+at risk of quietly discarding earlier seeds).
+
+Trust (sanity-check-passed) status per seed is read the same way, from a small sidecar file
+(dqn_sanity_seed<N>.csv) written alongside each seed's evaluation from now on. Seeds trained
+before this sidecar existed have no such file; for those, trust is recovered from the
+all_sanity_checks_passed column of a pre-existing multiseed_per_seed_summary.csv in the same
+directory (which already carried that flag for every seed run under the old code) rather
+than assumed.
+
 Run:
     python3 src/multiseed_study.py                                        # 5 seeds x 50 episodes, default reward
     python3 src/multiseed_study.py --seeds 0 1 --episodes 3               # smoke test
     python3 src/multiseed_study.py --reward freshness_bonus               # Step 2: same 5 seeds, freshness bonus
     python3 src/multiseed_study.py --reward freshness_bonus --seeds 0 1 --episodes 3  # Step 2 smoke test
+    python3 src/multiseed_study.py --seeds 5 6 7 8 9                      # Step 3: extends seeds 0-4 to 0-9
 """
 
 from __future__ import annotations
 
 import argparse
+import re
 import shutil
 import time
 from pathlib import Path
@@ -47,6 +66,17 @@ from dqn_agent import EVAL_EVERY, DQNAgent, evaluate, sanity_checks, train
 from environment import CSV_DIR, MODEL_DIR, default_reward, ensure_output_dirs, freshness_bonus_reward
 
 MULTISEED_CSV_DIR = CSV_DIR / "multiseed"
+
+_SEED_NUM_RE = re.compile(r"seed(\d+)\.csv$")
+
+
+def _display_path(p: Path) -> str:
+    """Path relative to the project root for display, or the absolute path if p falls
+    outside it (e.g. --out-dir/--weights-dir pointed at a scratch directory for testing)."""
+    try:
+        return str(p.relative_to(CSV_DIR.parent.parent))
+    except ValueError:
+        return str(p)
 
 # Name -> reward function. "default" maps to default_reward explicitly (rather than None)
 # so the printed reward name in train()'s banner is always informative, never "None".
@@ -87,7 +117,7 @@ def run_one_seed(seed: int, episodes: int, eval_every: int, reward_name: str,
     seed_checkpoints = out_dir / f"dqn_greedy_checkpoints_seed{seed}.csv"
     if unsuffixed.exists():
         shutil.move(str(unsuffixed), str(seed_checkpoints))
-        print(f"  moved {unsuffixed.name} -> {seed_checkpoints.relative_to(CSV_DIR.parent.parent)}")
+        print(f"  moved {unsuffixed.name} -> {_display_path(seed_checkpoints)}")
     else:
         # eval_every could in principle be set to skip every checkpoint (0 or > episodes);
         # train() then never writes the file. Not an error, just nothing to move.
@@ -112,6 +142,14 @@ def run_one_seed(seed: int, episodes: int, eval_every: int, reward_name: str,
         print(f"  *** WARNING: seed {seed} FAILED one or more sanity checks - "
               f"its results should NOT be trusted without investigation ***")
 
+    # Persist the trust verdict as its own seed-keyed sidecar (not just in this process's
+    # memory), so a LATER invocation's glob-based aggregation can recover it without having
+    # re-run this seed. See discover_seed_trust().
+    sanity_df = pd.DataFrame([{"check": name, "passed": ok, "detail": detail}
+                              for name, ok, detail in checks])
+    sanity_df.insert(0, "seed", seed)
+    sanity_df.to_csv(out_dir / f"dqn_sanity_seed{seed}.csv", index=False)
+
     # ---- model weights, seed-suffixed, never collides with the shipped model ----
     weights_path = weights_dir / f"dqn_weights_seed{seed}.npz"
     np.savez(weights_path,
@@ -123,7 +161,7 @@ def run_one_seed(seed: int, episodes: int, eval_every: int, reward_name: str,
     for p in (seed_checkpoints if unsuffixed.exists() or seed_checkpoints.exists() else None,
              log_path, eval_path, weights_path):
         if p is not None:
-            print(f"    {p.relative_to(CSV_DIR.parent.parent)}")
+            print(f"    {_display_path(p)}")
 
     dqn_row = eval_df.loc["DQN"].to_dict()
     dqn_row["seed"] = seed
@@ -132,18 +170,95 @@ def run_one_seed(seed: int, episodes: int, eval_every: int, reward_name: str,
     return dqn_row
 
 
-def aggregate(seed_rows: list[dict]) -> pd.DataFrame:
+def _seeds_from_filenames(paths) -> dict[int, Path]:
+    """{seed_number: path}, parsed from every ...seed<N>.csv path given."""
+    out = {}
+    for p in paths:
+        m = _SEED_NUM_RE.search(p.name)
+        if m:
+            out[int(m.group(1))] = p
+    return out
+
+
+def discover_seed_evaluations(out_dir: Path) -> dict[int, dict]:
     """
-    mean/std/min/max across seeds for the headline metrics, computed ONLY from seeds that
-    passed every sanity check - a seed with an illegal-action bug or a non-deterministic
-    greedy policy is a broken measurement, not a data point on the variance being studied.
+    Every dqn_evaluation_seed*.csv actually present in out_dir, keyed by seed number, mapped
+    to that seed's DQN row as a dict. This globs the DIRECTORY rather than trusting any
+    in-memory list of seeds, which is what lets a later invocation's aggregation see seeds
+    trained by an earlier invocation.
     """
-    df = pd.DataFrame(seed_rows)
+    rows = {}
+    for seed, path in sorted(_seeds_from_filenames(out_dir.glob("dqn_evaluation_seed*.csv")).items()):
+        df = pd.read_csv(path, index_col=0)
+        rows[seed] = df.loc["DQN"].to_dict()
+    return rows
+
+
+def discover_seed_trust(out_dir: Path) -> dict[int, bool]:
+    """
+    all_sanity_checks_passed per seed, by seed number, from whichever seeds have a record on
+    disk - not from this invocation's memory. Two sources, sidecar taking precedence:
+
+      1. dqn_sanity_seed<N>.csv - written by run_one_seed for every seed trained under this
+         version of the script. Authoritative going forward.
+      2. multiseed_per_seed_summary.csv, if present - covers seeds trained before the sidecar
+         existed, so upgrading this script does not silently drop their trust status (and
+         with it, their contribution to the aggregate) just because the bookkeeping changed.
+
+    A seed with neither source is treated as UNTRUSTED (excluded, with a warning) rather
+    than assumed passing - the earlier design's rule was "prove it passed", not "assume it
+    did", and that should not weaken just because the record of it lives on disk instead of
+    in memory.
+    """
+    trust: dict[int, bool] = {}
+    for seed, path in sorted(_seeds_from_filenames(out_dir.glob("dqn_sanity_seed*.csv")).items()):
+        trust[seed] = bool(pd.read_csv(path)["passed"].all())
+
+    legacy_path = out_dir / "multiseed_per_seed_summary.csv"
+    if legacy_path.exists():
+        legacy = pd.read_csv(legacy_path)
+        for _, row in legacy.iterrows():
+            s = int(row["seed"])
+            if s not in trust:  # sidecar, when present, always wins
+                trust[s] = bool(row["all_sanity_checks_passed"])
+    return trust
+
+
+def aggregate(out_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    mean/std/min/max across EVERY seed present on disk in out_dir (see
+    discover_seed_evaluations), restricted to seeds that passed every sanity check (see
+    discover_seed_trust) - a seed with an illegal-action bug or a non-deterministic greedy
+    policy is a broken measurement, not a data point on the variance being studied.
+
+    Rebuilding from disk on every call - rather than from whatever seeds this process just
+    trained - is what makes running additional seeds later EXTEND the aggregate instead of
+    replacing it.
+    """
+    evaluations = discover_seed_evaluations(out_dir)
+    trust = discover_seed_trust(out_dir)
+
+    rows = []
+    untrusted_seeds = []
+    for seed, row in evaluations.items():
+        passed = trust.get(seed)
+        if passed is None:
+            print(f"  WARNING: seed {seed} has an evaluation file but no sanity-check "
+                  f"record (no sidecar, no legacy summary entry) - excluding it rather than "
+                  f"assuming it passed.")
+            passed = False
+        row = dict(row)
+        row["seed"] = seed
+        row["all_sanity_checks_passed"] = passed
+        rows.append(row)
+        if not passed:
+            untrusted_seeds.append(seed)
+
+    df = pd.DataFrame(rows).sort_values("seed").reset_index(drop=True)
     trusted = df[df["all_sanity_checks_passed"]]
-    dropped = len(df) - len(trusted)
-    if dropped:
-        print(f"\n  NOTE: {dropped} of {len(df)} seed(s) failed a sanity check and are "
-              f"EXCLUDED from the aggregate stats below.")
+    if untrusted_seeds:
+        print(f"\n  NOTE: seed(s) {untrusted_seeds} failed a sanity check (or have no "
+              f"verifiable record) and are EXCLUDED from the aggregate stats below.")
 
     stats = trusted[HEADLINE_METRICS].agg(["mean", "std", "min", "max"]).T
     stats.insert(0, "n_seeds", len(trusted))
@@ -160,15 +275,25 @@ def main() -> None:
                         help="Reward variant to train and evaluate under. A variant other "
                              "than 'default' writes to its own subdirectory so it can never "
                              "overwrite another variant's results.")
+    parser.add_argument("--out-dir", type=Path, default=None,
+                        help="Override the output CSV directory. Advanced/testing use only "
+                             "(e.g. verifying the aggregation logic against a scratch copy "
+                             "without touching real results) - leave unset for a real run.")
+    parser.add_argument("--weights-dir", type=Path, default=None,
+                        help="Override the model weights directory. Same testing use as "
+                             "--out-dir.")
     args = parser.parse_args()
 
     reward_fn = REWARD_VARIANTS[args.reward]
     # "default" keeps Step 1's exact existing layout (results/csv/multiseed/, models/) so
     # a default-reward re-run stays byte-path-compatible with everything already produced.
     # Any other variant gets its own subdirectory, which is the sole thing that guarantees
-    # it can never collide with or overwrite another variant's files.
-    out_dir = MULTISEED_CSV_DIR if args.reward == "default" else MULTISEED_CSV_DIR / args.reward
-    weights_dir = MODEL_DIR if args.reward == "default" else MODEL_DIR / args.reward
+    # it can never collide with or overwrite another variant's files. --out-dir/--weights-dir
+    # override both, for testing against an isolated directory.
+    out_dir = args.out_dir or (MULTISEED_CSV_DIR if args.reward == "default"
+                               else MULTISEED_CSV_DIR / args.reward)
+    weights_dir = args.weights_dir or (MODEL_DIR if args.reward == "default"
+                                       else MODEL_DIR / args.reward)
 
     ensure_output_dirs()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -177,17 +302,22 @@ def main() -> None:
     print("=" * 100)
     print(f"MULTI-SEED VARIANCE STUDY: reward={args.reward}, {len(args.seeds)} seeds "
           f"{args.seeds}, {args.episodes} episodes each")
-    print(f"Outputs -> {out_dir.relative_to(CSV_DIR.parent.parent)}/ and "
-          f"{weights_dir.relative_to(CSV_DIR.parent.parent)}/")
+    print(f"Outputs -> {_display_path(out_dir)}/ and "
+          f"{_display_path(weights_dir)}/")
     print("=" * 100)
 
     t_start = time.time()
-    seed_rows = [run_one_seed(s, args.episodes, args.eval_every, args.reward, reward_fn,
-                              out_dir, weights_dir)
-                for s in args.seeds]
+    for s in args.seeds:
+        run_one_seed(s, args.episodes, args.eval_every, args.reward, reward_fn,
+                    out_dir, weights_dir)
     total_elapsed = time.time() - t_start
 
-    stats, per_seed_df = aggregate(seed_rows)
+    # Rebuilt from EVERY dqn_evaluation_seed*.csv present in out_dir, not just the seeds
+    # args.seeds names in this invocation - so running more seeds later extends this instead
+    # of replacing it. See aggregate()'s docstring.
+    stats, per_seed_df = aggregate(out_dir)
+    all_seeds_on_disk = sorted(per_seed_df["seed"].tolist())
+    newly_trained = sorted(args.seeds)
 
     per_seed_path = out_dir / "multiseed_per_seed_summary.csv"
     per_seed_df.to_csv(per_seed_path, index=False)
@@ -199,20 +329,22 @@ def main() -> None:
     print("FINAL SUMMARY")
     print("=" * 100)
     print(f"  reward variant      : {args.reward}")
-    print(f"  seeds run           : {args.seeds}")
-    print(f"  episodes per seed   : {args.episodes}")
-    print(f"  total wall time     : {total_elapsed / 60:.1f} min")
+    print(f"  seeds trained THIS run : {newly_trained}")
+    print(f"  seeds on disk (all)    : {all_seeds_on_disk}  <- aggregate below covers these")
+    print(f"  episodes per seed      : {args.episodes}")
+    print(f"  total wall time (this run) : {total_elapsed / 60:.1f} min")
     print()
     with pd.option_context("display.width", 140, "display.float_format", lambda v: f"{v:,.2f}"):
-        print("  Per-seed DQN evaluation:")
+        print(f"  Per-seed DQN evaluation (ALL {len(per_seed_df)} seeds on disk):")
         print(per_seed_df[["seed"] + HEADLINE_METRICS + ["all_sanity_checks_passed"]]
               .to_string(index=False))
         print()
-        print("  Aggregate (mean / std / min / max across sanity-check-passing seeds):")
+        print(f"  Aggregate (mean / std / min / max across {stats['n_seeds'].iloc[0]} "
+              f"sanity-check-passing seeds):")
         print(stats.to_string(index=False))
     print()
-    print(f"  Per-seed summary -> {per_seed_path.relative_to(CSV_DIR.parent.parent)}")
-    print(f"  Aggregate stats   -> {stats_path.relative_to(CSV_DIR.parent.parent)}")
+    print(f"  Per-seed summary -> {_display_path(per_seed_path)}")
+    print(f"  Aggregate stats   -> {_display_path(stats_path)}")
     print("=" * 100)
 
 
