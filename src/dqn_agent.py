@@ -18,6 +18,11 @@ Architecture notes:
   * Reward is the environment's `default_reward` (utilization - weighted Gold scheduling
     delay), scaled by REWARD_SCALE purely for numerical conditioning of the network. The
     scaling never touches reported metrics.
+  * REPLAY is uniform by default (ReplayBuffer). PrioritizedReplayBuffer is an opt-in
+    alternative (see --replay in multiseed_study.py) that samples transitions in proportion
+    to their last-measured |TD error|, backed by a sum tree for O(log capacity) sampling and
+    priority update - see PrioritizedReplayBuffer's and SumTree's docstrings for the
+    efficiency reasoning at this buffer's scale (200,000 transitions).
 
 TRAINING SCALE - why the full environment. The obvious speed-up is to subsample Bronze,
 but that was measured and it destroys the thing being learned: at stride 5 and 10 the
@@ -77,6 +82,24 @@ EPS_DECAY_STEPS = 1_500_000
 N_EPISODES = 50
 EVAL_EVERY = 5           # greedy checkpoint cadence, in episodes
 GRAD_CLIP = 10.0
+
+# ----------------------------------------------------------------------------------
+# PRIORITIZED EXPERIENCE REPLAY (Schaul et al., 2016) - OPT-IN, see --replay in
+# multiseed_study.py. Uniform replay (ReplayBuffer, the existing behaviour) stays the
+# default; nothing below is read unless PrioritizedReplayBuffer is explicitly selected.
+# ----------------------------------------------------------------------------------
+PER_ALPHA = 0.6           # 0 = uniform sampling, 1 = fully proportional to |TD error|.
+                          # 0.6 is the paper's own default for the proportional variant.
+PER_EPS = 1e-3            # added to |TD error| before exponentiating, so a transition with
+                          # zero measured error still has nonzero sampling probability
+                          # rather than becoming permanently unreachable.
+PER_BETA_START = 0.4      # importance-sampling correction strength at the start of training
+PER_BETA_END = 1.0        # ... anneals to fully unbiased correction by the time training
+                          # is mostly exploiting rather than exploring - see DQNAgent._per_beta.
+# Same clock as epsilon (agent.total_steps, in environment steps) and the same horizon, so
+# beta reaches 1.0 right as exploration ends - full IS correction matters most once the
+# agent is relying on the learned policy rather than epsilon-random actions.
+PER_BETA_ANNEAL_STEPS = EPS_DECAY_STEPS
 
 # Rewards run to roughly [-10, +1] per step under the count-normalised reward (a Gold job
 # placed after the full 1,511 s t=0 backlog costs -10 * 1511/1532 = -9.86). Scaling by 0.1
@@ -165,7 +188,15 @@ class MLP:
 # ----------------------------------------------------------------------------------
 
 class ReplayBuffer:
-    """Uniform replay. Stores the next-state action mask so bootstrapping can be masked."""
+    """
+    Uniform replay. Stores the next-state action mask so bootstrapping can be masked.
+
+    `sample()` returns `(idx, weights)` alongside the transition batch, and `add()`/
+    `update_priorities()` complete the same interface PrioritizedReplayBuffer implements
+    below - `idx` is always the sampled buffer slots and `weights` is always all-ones here
+    (a no-op multiplier), so DQNAgent.train_step() can call either buffer class through
+    identical code with no branching on which mode is active.
+    """
 
     def __init__(self, capacity: int, obs_dim: int, n_actions: int, seed: int = 0):
         self.capacity = capacity
@@ -190,10 +221,182 @@ class ReplayBuffer:
         self._ptr = (i + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
 
-    def sample(self, batch_size: int):
+    def sample(self, batch_size: int, beta: float = 1.0):
+        """`beta` is accepted for interface parity with PrioritizedReplayBuffer and ignored
+        here - uniform sampling needs no importance-sampling correction."""
         idx = self.rng.integers(0, self.size, size=batch_size)
+        weights = np.ones(batch_size, dtype=np.float32)
         return (self.obs[idx], self.actions[idx], self.rewards[idx],
-                self.next_obs[idx], self.dones[idx], self.next_mask[idx])
+                self.next_obs[idx], self.dones[idx], self.next_mask[idx], idx, weights)
+
+    def update_priorities(self, idx: np.ndarray, td_errors: np.ndarray) -> None:
+        """No-op: uniform replay does not track per-transition priority."""
+
+
+class SumTree:
+    """
+    Fixed-capacity binary tree stored as one flat array, giving O(log capacity) priority
+    update and O(log capacity) single-sample lookup regardless of how many transitions are
+    stored - the standard structure behind proportional prioritized replay (Schaul et al.,
+    2016). Leaves hold each buffer slot's priority; every internal node holds the sum of
+    its subtree, so the root (index 0) is the total priority mass in O(1). This is what
+    makes prioritized sampling viable at this buffer's scale - see PrioritizedReplayBuffer's
+    docstring for the concrete cost comparison against a naive O(capacity) weighted draw.
+
+    Layout: a full binary tree with `capacity` leaves needs `capacity - 1` internal nodes,
+    so the flat array has `2 * capacity - 1` slots. The leaf for buffer slot `i` lives at
+    `capacity - 1 + i`; its parent is `(leaf - 1) // 2`, up to the root at index 0. This
+    does NOT require `capacity` to be a power of two.
+    """
+
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+        # float64: this array is updated by repeated += over hundreds of thousands of
+        # priority changes across training, and float32 accumulation error would drift the
+        # root's total away from the true sum of leaves over that many updates.
+        self.tree = np.zeros(2 * capacity - 1, dtype=np.float64)
+
+    def total(self) -> float:
+        return float(self.tree[0])
+
+    def set(self, data_idx: int, priority: float) -> None:
+        """Set one leaf's priority and propagate the change to the root. O(log capacity)."""
+        leaf = data_idx + self.capacity - 1
+        delta = priority - self.tree[leaf]
+        self.tree[leaf] = priority
+        i = leaf
+        while i != 0:
+            i = (i - 1) // 2
+            self.tree[i] += delta
+
+    def set_batch(self, data_idx: np.ndarray, priorities: np.ndarray) -> None:
+        """
+        Set many leaves. A plain loop over the batch (64 by default), each iteration
+        O(log capacity) - there is no safe vectorisation across a batch here, because
+        different sampled leaves can share ancestor nodes, and updating those shared
+        ancestors independently per-sample (rather than accumulating deltas first) would
+        double-count. A batch of 64 at depth ~18 is ~1,150 array touches: see
+        PrioritizedReplayBuffer's docstring for why that is not the bottleneck here.
+        """
+        for i, p in zip(data_idx, priorities):
+            self.set(int(i), float(p))
+
+    def _get_leaf(self, s: float) -> int:
+        """Walk down from the root to the leaf whose cumulative range contains `s`.
+        O(log capacity)."""
+        i = 0
+        n = len(self.tree)
+        while True:
+            left = 2 * i + 1
+            if left >= n:  # `i` has no children - it is a leaf
+                return i
+            if s <= self.tree[left]:
+                i = left
+            else:
+                s -= self.tree[left]
+                i = left + 1
+
+    def sample_batch(self, batch_size: int, rng: np.random.Generator):
+        """
+        Stratified proportional sampling: split [0, total) into `batch_size` equal-width
+        segments and draw one uniform value per segment, then walk the tree for each. This
+        is Schaul et al.'s recommended scheme (lower-variance batches than i.i.d. proportional
+        draws) and costs O(batch_size * log capacity) total - independent of how full the
+        buffer is. Returns (data_indices, leaf_priorities).
+        """
+        total = self.total()
+        segment = total / batch_size
+        data_idx = np.empty(batch_size, dtype=np.int64)
+        priorities = np.empty(batch_size, dtype=np.float64)
+        for b in range(batch_size):
+            s = rng.uniform(segment * b, segment * (b + 1))
+            leaf = self._get_leaf(s)
+            data_idx[b] = leaf - (self.capacity - 1)
+            priorities[b] = self.tree[leaf]
+        return data_idx, priorities
+
+
+class PrioritizedReplayBuffer(ReplayBuffer):
+    """
+    Proportional prioritized replay (Schaul et al., 2016): transitions with larger absolute
+    TD error are sampled more often, on the premise that they carry more learning signal.
+    Backed by SumTree above for O(log capacity) priority update and O(log capacity) sampling
+    per transition - see that class's docstring for the layout, and the module-level PER_*
+    constants for the algorithm's hyperparameters (alpha, epsilon, beta schedule).
+
+    EFFICIENCY, ADDRESSED DIRECTLY. At this buffer's scale (capacity 200,000, sampled every
+    TRAIN_EVERY=4 of ~43,600 env steps/episode -> ~10,900 sample() + update_priorities()
+    call PAIRS per episode, batch_size=64), a naive weighted draw over the full buffer
+    (e.g. np.random.choice(size, p=priorities/priorities.sum())) is O(capacity) per call
+    purely to build/search the cumulative distribution - about 200,000 element touches
+    EVERY call, ~2.2 billion over one episode's worth of calls. The sum tree instead costs
+    O(log2(capacity)) ~= 18 node visits per single sample or per single priority update, so
+    one batch of 64 costs ~1,150 node visits for sample_batch() and ~1,150 for
+    set_batch() - regardless of whether the buffer holds 5,000 or 200,000 transitions. That
+    keeps the added cost roughly constant as the buffer fills, rather than growing with it,
+    which is the property that actually matters for training - if it scaled with capacity,
+    doubling BUFFER_CAPACITY to chase Step 2's "late-episode states get overwritten before
+    they're learned from" problem would have made prioritized replay steadily more expensive
+    for exactly the runs that need a bigger buffer most.
+
+    This still is NOT free: every sample()/update_priorities() pair is O(batch_size *
+    log capacity) of real Python-level tree-walk work, on top of the MLP forward/backward
+    cost uniform replay already pays. Expect prioritized runs to run somewhat slower than
+    uniform ones per episode - the smoke test recommended after this implementation is the
+    way to get an actual measurement rather than trust an estimate.
+    """
+
+    def __init__(self, capacity: int, obs_dim: int, n_actions: int, seed: int = 0,
+                alpha: float = PER_ALPHA, eps: float = PER_EPS):
+        super().__init__(capacity, obs_dim, n_actions, seed=seed)
+        self.tree = SumTree(capacity)
+        self.alpha = alpha
+        self.eps = eps
+        # New transitions have no TD error yet, so they get the highest priority seen so
+        # far - guaranteeing every transition is sampled (and its real priority measured)
+        # at least once, rather than starting at priority 0 and potentially never being
+        # drawn. Starts at 1.0 so the very first transitions in an empty buffer are sampled
+        # uniformly relative to each other until real TD errors start arriving.
+        self._max_priority = 1.0
+
+    def add(self, obs, action, reward, next_obs, done, next_mask):
+        idx = self._ptr  # capture BEFORE super().add() advances the ring-buffer pointer
+        super().add(obs, action, reward, next_obs, done, next_mask)
+        self.tree.set(idx, self._max_priority ** self.alpha)
+
+    def sample(self, batch_size: int, beta: float = 1.0):
+        """
+        `beta` is the importance-sampling exponent (see DQNAgent._per_beta) - 0 applies no
+        correction, 1 fully corrects the bias non-uniform sampling introduces relative to
+        the transition's true frequency in the buffer.
+        """
+        idx, leaf_priorities = self.tree.sample_batch(batch_size, self.rng)
+        total = self.tree.total()
+        probs = leaf_priorities / total
+
+        # Standard PER importance-sampling weight: w_i = (N * P(i)) ** -beta, then normalise
+        # by the batch max so weights only ever scale a gradient DOWN, never up - up-scaling
+        # would let a single rare, high-priority sample dominate an update far more than an
+        # ordinary uniform-replay sample ever could, which is a stability risk the paper's
+        # own normalisation avoids.
+        weights = (self.size * probs) ** (-beta)
+        weights = weights / weights.max()
+
+        return (self.obs[idx], self.actions[idx], self.rewards[idx],
+                self.next_obs[idx], self.dones[idx], self.next_mask[idx],
+                idx, weights.astype(np.float32))
+
+    def update_priorities(self, idx: np.ndarray, td_errors: np.ndarray) -> None:
+        """
+        Called after every train_step with that step's actual |TD error| per sampled
+        transition, so a transition's priority reflects how surprising it was THE LAST TIME
+        it was sampled (it is not recomputed between samples - recomputing every stored
+        transition's TD error every step would itself be the O(capacity) cost this whole
+        structure exists to avoid).
+        """
+        priorities = (np.abs(td_errors) + self.eps) ** self.alpha
+        self.tree.set_batch(idx, priorities)
+        self._max_priority = max(self._max_priority, float(priorities.max()))
 
 
 # ----------------------------------------------------------------------------------
@@ -224,16 +427,24 @@ class TrainingLog:
 
 
 class DQNAgent:
-    """Deep Q-Network with target network, uniform replay and action masking."""
+    """
+    Deep Q-Network with target network and action masking.
+
+    `replay_cls` selects the replay strategy - ReplayBuffer (uniform, the default) or
+    PrioritizedReplayBuffer (opt-in, see --replay in multiseed_study.py). Both classes
+    share the same constructor signature and the same sample()/add()/update_priorities()
+    interface, so nothing else in this class branches on which one is active.
+    """
 
     name = "DQN"
 
-    def __init__(self, obs_dim: int, n_actions: int, seed: int = SEED):
+    def __init__(self, obs_dim: int, n_actions: int, seed: int = SEED,
+                replay_cls: type = ReplayBuffer):
         self.n_actions = n_actions
         self.online = MLP(obs_dim, n_actions, seed=seed)
         self.target = MLP(obs_dim, n_actions, seed=seed)
         self.target.copy_from(self.online)
-        self.buffer = ReplayBuffer(BUFFER_CAPACITY, obs_dim, n_actions, seed=seed)
+        self.buffer = replay_cls(BUFFER_CAPACITY, obs_dim, n_actions, seed=seed)
         self.rng = np.random.default_rng(seed)
         self.total_steps = 0
         self.last_q_abs = float("nan")
@@ -246,6 +457,17 @@ class DQNAgent:
             return 0.0
         frac = min(1.0, self.total_steps / EPS_DECAY_STEPS)
         return EPS_START + frac * (EPS_END - EPS_START)
+
+    def _per_beta(self) -> float:
+        """
+        Importance-sampling exponent for prioritized replay, annealed on the same clock as
+        epsilon (self.total_steps, in environment steps - not gradient steps, so it advances
+        identically regardless of TRAIN_EVERY). Always computed, even under uniform replay:
+        ReplayBuffer.sample() accepts and ignores `beta`, so this never needs a branch at the
+        call site, and computing it is a few flops either way.
+        """
+        frac = min(1.0, self.total_steps / PER_BETA_ANNEAL_STEPS)
+        return PER_BETA_START + frac * (PER_BETA_END - PER_BETA_START)
 
     def act(self, obs: np.ndarray, mask: np.ndarray) -> int:
         legal = np.flatnonzero(mask)
@@ -266,7 +488,8 @@ class DQNAgent:
         if self.buffer.size < max(WARMUP_STEPS, BATCH_SIZE):
             return float("nan")
 
-        obs, actions, rewards, next_obs, dones, next_mask = self.buffer.sample(BATCH_SIZE)
+        obs, actions, rewards, next_obs, dones, next_mask, idx, is_weights = \
+            self.buffer.sample(BATCH_SIZE, beta=self._per_beta())
 
         # DOUBLE DQN bootstrap: the ONLINE net picks the next action, the TARGET net scores
         # it. Decoupling selection from evaluation removes the max-operator's optimistic
@@ -289,13 +512,26 @@ class DQNAgent:
         self.last_q_abs = float(np.mean(np.abs(q_all)))
 
         # Huber (smooth L1) gradient: clip the error to keep outliers from dominating.
+        # is_weights is all-ones under uniform replay (a no-op factor); under prioritized
+        # replay it down-weights the over-represented high-priority samples so the update
+        # is corrected back toward what uniform sampling would have produced - the standard
+        # bias correction for non-uniform replay, applied to the gradient exactly where the
+        # per-sample error enters the loss.
         err = q_taken - targets
-        grad_taken = np.clip(err, -1.0, 1.0) / BATCH_SIZE
+        grad_taken = is_weights * np.clip(err, -1.0, 1.0) / BATCH_SIZE
 
         grad_out = np.zeros_like(q_all)
         grad_out[rows, actions] = grad_taken
         self.online.backward(acts, grad_out)
 
+        # Priority refresh: no-op under uniform replay. Uses the RAW (unclipped, unweighted)
+        # error, not grad_taken - priority should reflect how wrong the prediction actually
+        # was, independent of the Huber clip or the IS correction applied to the gradient.
+        self.buffer.update_priorities(idx, err)
+
+        # Reported/logged as the plain mean |TD error|, not IS-weighted, so this number
+        # means the same thing under both replay modes and stays comparable across a
+        # uniform-vs-prioritized smoke test.
         return float(np.mean(np.abs(err)))
 
     def soft_update(self, tau: float = TAU):
@@ -379,22 +615,29 @@ def greedy_eval(agent: "DQNAgent", seed: int = 0) -> dict:
 
 
 def train(n_episodes: int = N_EPISODES, seed: int = SEED, eval_every: int = EVAL_EVERY,
-         reward_fn=None) -> tuple[DQNAgent, pd.DataFrame]:
+         reward_fn=None, replay_cls: type = ReplayBuffer) -> tuple[DQNAgent, pd.DataFrame]:
     """
     reward_fn: passed straight through to ClusterSchedulingEnv(reward_fn=...). None (the
     default) reproduces the exact prior behaviour - the environment's own default is
     default_reward. Pass e.g. environment.freshness_bonus_reward to train under a different
     reward variant; see multiseed_study.py --reward.
+
+    replay_cls: ReplayBuffer (default, uniform sampling - reproduces prior behaviour exactly)
+    or PrioritizedReplayBuffer, passed straight through to DQNAgent(replay_cls=...). See
+    multiseed_study.py --replay.
     """
     env = ClusterSchedulingEnv(reward_fn=reward_fn)  # tick=1.0 by default, core reward by default
-    agent = DQNAgent(env.observation_space.shape[0], env.action_space.n, seed=seed)
+    agent = DQNAgent(env.observation_space.shape[0], env.action_space.n, seed=seed,
+                     replay_cls=replay_cls)
     log = TrainingLog()
     eval_rows: list[dict] = []
     best = {"score": float("inf"), "episode": None, "weights": None, "metrics": None}
 
     reward_name = reward_fn.__name__ if reward_fn is not None else "default_reward"
+    replay_name = replay_cls.__name__
     print(f"Environment : {env.n_jobs:,} jobs ({env.n_gold_total:,} Gold), "
           f"{env.n_machines} machines, tick={env.scheduling_tick}, reward={reward_name}")
+    print(f"Replay      : {replay_name}")
     print(f"Network     : {env.observation_space.shape[0]} -> {HIDDEN} -> {env.action_space.n}")
     print(f"Training    : {n_episodes} episodes\n")
     print(f"{'ep':>3s} {'steps':>7s} {'reward':>10s} {'R_gold':>9s} {'R_bronze':>9s} "

@@ -43,12 +43,26 @@ all_sanity_checks_passed column of a pre-existing multiseed_per_seed_summary.csv
 directory (which already carried that flag for every seed run under the old code) rather
 than assumed.
 
+STEP 4 - PRIORITIZED REPLAY. --replay selects the DQN's replay buffer, mirroring exactly how
+--reward selects the reward function above: "uniform" (default, the existing ReplayBuffer,
+byte-path-compatible with every prior run) or "prioritized"
+(dqn_agent.PrioritizedReplayBuffer). Like --reward, a non-default --replay writes to its own
+subdirectory, layered onto any --reward subdirectory already in play (results/csv/multiseed/
+<reward>/<replay>/, skipping either path segment when it is the default) - so every
+combination of reward variant x replay mode gets its own untouchable slot, e.g.:
+    default reward   + uniform replay      -> results/csv/multiseed/
+    default reward   + prioritized replay  -> results/csv/multiseed/prioritized/
+    freshness_bonus  + uniform replay      -> results/csv/multiseed/freshness_bonus/
+    freshness_bonus  + prioritized replay  -> results/csv/multiseed/freshness_bonus/prioritized/
+
 Run:
-    python3 src/multiseed_study.py                                        # 5 seeds x 50 episodes, default reward
+    python3 src/multiseed_study.py                                        # 5 seeds x 50 episodes, default reward, uniform replay
     python3 src/multiseed_study.py --seeds 0 1 --episodes 3               # smoke test
     python3 src/multiseed_study.py --reward freshness_bonus               # Step 2: same 5 seeds, freshness bonus
     python3 src/multiseed_study.py --reward freshness_bonus --seeds 0 1 --episodes 3  # Step 2 smoke test
     python3 src/multiseed_study.py --seeds 5 6 7 8 9                      # Step 3: extends seeds 0-4 to 0-9
+    python3 src/multiseed_study.py --replay prioritized                  # Step 4: same 5 seeds, prioritized replay
+    python3 src/multiseed_study.py --replay prioritized --seeds 0 1 --episodes 3  # Step 4 smoke test
 """
 
 from __future__ import annotations
@@ -62,7 +76,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from dqn_agent import EVAL_EVERY, DQNAgent, evaluate, sanity_checks, train
+from dqn_agent import (EVAL_EVERY, DQNAgent, PrioritizedReplayBuffer, ReplayBuffer, evaluate,
+                       sanity_checks, train)
 from environment import CSV_DIR, MODEL_DIR, default_reward, ensure_output_dirs, freshness_bonus_reward
 
 MULTISEED_CSV_DIR = CSV_DIR / "multiseed"
@@ -85,34 +100,45 @@ REWARD_VARIANTS = {
     "freshness_bonus": freshness_bonus_reward,
 }
 
+# Name -> replay buffer class. "uniform" maps to the existing ReplayBuffer, so a run with
+# --replay unset (or explicitly "uniform") is byte-path-compatible with every prior run.
+REPLAY_MODES = {
+    "uniform": ReplayBuffer,
+    "prioritized": PrioritizedReplayBuffer,
+}
+
 # Metrics the aggregate table reports mean/std/min/max for.
 HEADLINE_METRICS = ["gold_avg_scheduling_delay", "late_gold_avg_delay",
                     "bronze_avg_waiting_time"]
 
 
 def run_one_seed(seed: int, episodes: int, eval_every: int, reward_name: str,
-                 reward_fn, out_dir: Path, weights_dir: Path) -> dict:
+                 reward_fn, replay_name: str, replay_cls: type,
+                 out_dir: Path, weights_dir: Path) -> dict:
     """
     Train and evaluate one seed, writing every output to a seed-suffixed path under
-    out_dir/weights_dir (which are reward-variant-specific - see main()).
+    out_dir/weights_dir (which are reward-variant/replay-mode-specific - see main()).
 
     Returns a dict with the seed, the DQN's evaluation row (as a dict), the sanity-check
     results, and whether all sanity checks passed - the caller decides whether to trust the
     seed's numbers based on that flag, per the user's requirement.
     """
     print("\n" + "=" * 100)
-    print(f"SEED {seed}  reward={reward_name}  ({episodes} episodes, checkpoints every {eval_every})")
+    print(f"SEED {seed}  reward={reward_name}  replay={replay_name}  "
+          f"({episodes} episodes, checkpoints every {eval_every})")
     print("=" * 100)
     t0 = time.time()
 
-    agent, log = train(n_episodes=episodes, seed=seed, eval_every=eval_every, reward_fn=reward_fn)
+    agent, log = train(n_episodes=episodes, seed=seed, eval_every=eval_every,
+                       reward_fn=reward_fn, replay_cls=replay_cls)
 
     # ---- move the just-written checkpoint file before the NEXT seed's train() call can
     # ---- overwrite it. This happens synchronously, before run_one_seed returns, so there
     # ---- is no window in which two seeds' train() calls are both in flight. train() always
-    # ---- writes to the SAME hardcoded top-level path regardless of reward variant, so this
-    # ---- move is what actually keeps a freshness_bonus run from clobbering Step 1's
-    # ---- default-reward checkpoint file (or a later seed clobbering an earlier one).
+    # ---- writes to the SAME hardcoded top-level path regardless of reward variant or replay
+    # ---- mode, so this move is what actually keeps a freshness_bonus/prioritized run from
+    # ---- clobbering Step 1's default-reward/uniform-replay checkpoint file (or a later seed
+    # ---- clobbering an earlier one).
     unsuffixed = CSV_DIR / "dqn_greedy_checkpoints.csv"
     seed_checkpoints = out_dir / f"dqn_greedy_checkpoints_seed{seed}.csv"
     if unsuffixed.exists():
@@ -266,6 +292,18 @@ def aggregate(out_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     return stats.reset_index(), df
 
 
+def layered_output_dir(base: Path, reward: str, replay: str) -> Path:
+    """base/<reward>/<replay>, skipping either segment when it is the default ("default"
+    reward, "uniform" replay) - module-level and independently testable so the four
+    resulting path combinations can be checked without going through main()/argparse."""
+    p = base
+    if reward != "default":
+        p = p / reward
+    if replay != "uniform":
+        p = p / replay
+    return p
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
@@ -275,6 +313,13 @@ def main() -> None:
                         help="Reward variant to train and evaluate under. A variant other "
                              "than 'default' writes to its own subdirectory so it can never "
                              "overwrite another variant's results.")
+    parser.add_argument("--replay", choices=sorted(REPLAY_MODES), default="uniform",
+                        help="Replay buffer to train with. 'uniform' (default) is the "
+                             "existing ReplayBuffer; 'prioritized' samples transitions in "
+                             "proportion to |TD error| (dqn_agent.PrioritizedReplayBuffer). "
+                             "A non-default value writes to its own subdirectory, layered "
+                             "onto --reward's, so it can never overwrite another mode's "
+                             "results.")
     parser.add_argument("--out-dir", type=Path, default=None,
                         help="Override the output CSV directory. Advanced/testing use only "
                              "(e.g. verifying the aggregation logic against a scratch copy "
@@ -285,23 +330,29 @@ def main() -> None:
     args = parser.parse_args()
 
     reward_fn = REWARD_VARIANTS[args.reward]
-    # "default" keeps Step 1's exact existing layout (results/csv/multiseed/, models/) so
-    # a default-reward re-run stays byte-path-compatible with everything already produced.
-    # Any other variant gets its own subdirectory, which is the sole thing that guarantees
-    # it can never collide with or overwrite another variant's files. --out-dir/--weights-dir
-    # override both, for testing against an isolated directory.
-    out_dir = args.out_dir or (MULTISEED_CSV_DIR if args.reward == "default"
-                               else MULTISEED_CSV_DIR / args.reward)
-    weights_dir = args.weights_dir or (MODEL_DIR if args.reward == "default"
-                                       else MODEL_DIR / args.reward)
+    replay_cls = REPLAY_MODES[args.replay]
+    # "default"/"uniform" keeps Step 1's exact existing layout (results/csv/multiseed/,
+    # models/) so a default-reward, uniform-replay re-run stays byte-path-compatible with
+    # everything already produced. Any other reward variant or replay mode layers its own
+    # subdirectory on top - reward first, then replay - which is the sole thing that
+    # guarantees no combination can collide with or overwrite another's files. See the
+    # module docstring's STEP 4 section for the four resulting path combinations.
+    # --out-dir/--weights-dir override both wholesale, for testing against an isolated
+    # directory.
+    # Each override is independent, exactly as before this edit: passing only --out-dir
+    # (leaving --weights-dir unset) still layers weights_dir normally, and vice versa.
+    out_dir = (args.out_dir if args.out_dir is not None
+              else layered_output_dir(MULTISEED_CSV_DIR, args.reward, args.replay))
+    weights_dir = (args.weights_dir if args.weights_dir is not None
+                  else layered_output_dir(MODEL_DIR, args.reward, args.replay))
 
     ensure_output_dirs()
     out_dir.mkdir(parents=True, exist_ok=True)
     weights_dir.mkdir(parents=True, exist_ok=True)
 
     print("=" * 100)
-    print(f"MULTI-SEED VARIANCE STUDY: reward={args.reward}, {len(args.seeds)} seeds "
-          f"{args.seeds}, {args.episodes} episodes each")
+    print(f"MULTI-SEED VARIANCE STUDY: reward={args.reward}, replay={args.replay}, "
+          f"{len(args.seeds)} seeds {args.seeds}, {args.episodes} episodes each")
     print(f"Outputs -> {_display_path(out_dir)}/ and "
           f"{_display_path(weights_dir)}/")
     print("=" * 100)
@@ -309,7 +360,7 @@ def main() -> None:
     t_start = time.time()
     for s in args.seeds:
         run_one_seed(s, args.episodes, args.eval_every, args.reward, reward_fn,
-                    out_dir, weights_dir)
+                    args.replay, replay_cls, out_dir, weights_dir)
     total_elapsed = time.time() - t_start
 
     # Rebuilt from EVERY dqn_evaluation_seed*.csv present in out_dir, not just the seeds
@@ -329,6 +380,7 @@ def main() -> None:
     print("FINAL SUMMARY")
     print("=" * 100)
     print(f"  reward variant      : {args.reward}")
+    print(f"  replay mode         : {args.replay}")
     print(f"  seeds trained THIS run : {newly_trained}")
     print(f"  seeds on disk (all)    : {all_seeds_on_disk}  <- aggregate below covers these")
     print(f"  episodes per seed      : {args.episodes}")
