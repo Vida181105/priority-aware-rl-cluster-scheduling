@@ -176,16 +176,63 @@ GOLD_FRESHNESS_TAU = SLA_THRESHOLD_SECONDS
 # the tier's own current mean is scale-invariant and needs only one shared constant.
 STARVATION_MULTIPLIER = 5.0
 
-# Overall strength of the starvation penalty. A rough sanity check behind this starting
-# value: a Gold job stuck at 3,000 s while its tier's mean sits at 50 s gives an excess of
-# 3,000 - 5*50 = 2,750 s; in SLA-threshold units that is (2750/5)^2 = 302,500; weighted
-# 10x for Gold and scaled by this constant, that is one step's charge of roughly
-# 1e-4 * 10 * 302,500 = 302.5 - a genuinely painful one-off penalty comparable in order of
-# magnitude to the largest existing per-step charges (the t=0 queue-holding burst reaches
-# about -9.87), which is the intent: this term should stay at 0 for the vast majority of
-# steps and only bite hard on a genuine, persisting outlier. A first cut, not yet tuned
-# empirically the way QUEUE_HOLD_FRACTION and UTIL_WEIGHT were.
+# SUPERSEDED - no longer used by phase_b_reward. Originally the sole multiplicative weight
+# on the raw squared-excess term (penalty = -STARVATION_WEIGHT * dt * w_tier * excess^2).
+# A direct trace against the seed-1 smoke-test scenario (a Gold job stranded at t~37,483s,
+# see results/csv/multiseed/phase_b/) showed this formula saturates REWARD_SCALE=0.02's
+# clip[-1,+1] on the very first step past the starvation threshold - 393 of 393 sampled
+# starved steps sat at exactly the -1.0 floor, with raw per-step values ranging from
+# -1,141.9 to -47,050.6 all clipping to the identical -1.0. Because excess grows unboundedly
+# the longer a job is neglected, no fixed weight can fix this: a smaller value only delays
+# where saturation starts, it cannot prevent it for the severe, persisting cases this term
+# exists to punish hardest. Replaced below by STARVATION_CAP/STARVATION_SATURATION_SCALE,
+# which bound the term's own contribution before it ever reaches REWARD_SCALE. Kept defined,
+# unused, as a record of the original (diagnosed-flawed) design - the project's established
+# practice for a superseded formula (see queue_delay_reward, sla_penalty_reward).
 STARVATION_WEIGHT = 1e-4
+
+# ---- BOUNDED STARVATION TERM (replaces the linear STARVATION_WEIGHT above) --------------
+#
+# THE FIX, AND WHY THIS FORM. The old term was excess^2 with nothing bounding it, so its
+# natural range (hundreds to tens of thousands) had no way to coexist with REWARD_SCALE's
+# working envelope (terms calibrated to roughly [-10, +1] per step - see REWARD_SCALE's own
+# comment). Squashing the FINAL result through a saturating nonlinearity fixes that, but
+# WHERE the nonlinearity is applied matters: tanh(excess) alone is concave from x=0 (its
+# derivative is maximal at the origin and falls immediately), so it would give the STEEPEST
+# response right at the threshold and flatten almost immediately after - the opposite of
+# "escalating", and itself close to a step function for any excess beyond a small multiple
+# of the scale. Applying tanh to the SQUARED, already-normalised excess instead preserves
+# the original design's intent: for z = (excess/SLA_THRESHOLD_SECONDS)^2 much smaller than
+# STARVATION_SATURATION_SCALE, tanh(z/K) ~= z/K (tanh is linear near 0), so the term is
+# still approximately QUADRATIC in excess near the threshold - a job 2x past the line still
+# costs ~4x, exactly the original "a starvation penalty should not be flat" reasoning - and
+# only bends toward the STARVATION_CAP ceiling once z approaches K, rather than jumping
+# there immediately.
+#
+# CALIBRATION, against the actual seed-1 trace rather than a hypothetical: the observed
+# excess in that run ranged from 10,335.6s at the first crossing down to 5,803.2s a couple
+# of steps later and up to 10,881.5s later in the same starved stretch - i.e. normalised-
+# squared excess (z) of roughly 1.35M-4.7M throughout. STARVATION_SATURATION_SCALE=3.7M
+# puts the SMALLEST of those (1.35M) at tanh~=0.35 (clearly non-zero, clearly not yet
+# saturated - room to escalate) and the LARGEST (4.7M) at tanh~=0.86 (clearly higher,
+# genuinely escalating, still short of the ceiling). A textbook "just past threshold" case
+# (500s excess, z~10,000, per the old constant's own worked example) gives tanh~=0.0027 -
+# small and clearly varying, as intended for a mild case. A truly extreme case - a job
+# stranded for nearly the whole episode, excess~40,000s, z~64M - gives tanh~=1.0000,
+# confirming the "decisively disqualify" ceiling is still reached, just smoothly rather
+# than as a step at the very first sample past the line.
+STARVATION_SATURATION_SCALE = 3_700_000.0
+
+# Ceiling on the starvation term's own per-step magnitude BEFORE the tier weight and dt are
+# applied. Chosen so a fully-saturated, dt=1, Gold-tier event lands at
+# GOLD_PRIORITY_WEIGHT * STARVATION_CAP = 30 raw, i.e. 30*REWARD_SCALE=0.6 once scaled -
+# strong (60% of the clip budget) and clearly dominant over an ordinary step, without
+# auto-clipping in isolation the way the unbounded version always did. A step that combines
+# full saturation with an unusually large dt (the clock occasionally jumps several seconds
+# past an idle stretch) can still reach the clip - that is the clip doing its intended job
+# as a backstop for genuinely extreme combined magnitudes, not the constant, degenerate
+# saturation the old formula produced on every single starved step regardless of severity.
+STARVATION_CAP = 3.0
 
 # Episode ends once the clock passes max(arrival_time) + this buffer.
 EPISODE_BUFFER_SECONDS = 3600.0
@@ -421,14 +468,48 @@ def phase_b_reward(env: "ClusterSchedulingEnv", info: dict) -> float:
 
     IN ONE SENTENCE: once a tier's single longest-waiting job has waited more than
     STARVATION_MULTIPLIER times that tier's own current mean wait, the excess (in units of
-    the SLA threshold) is squared and charged every second it persists, weighted 10:1 toward
-    Gold like every other term in this reward.
+    the SLA threshold) is squared, run through a saturating curve capped at STARVATION_CAP,
+    and charged every second it persists, weighted 10:1 toward Gold like every other term.
 
-        starvation_term = -STARVATION_WEIGHT * dt * sum over tier in {Gold, Bronze} of
-            w_tier * (max(0, worst_wait_tier - STARVATION_MULTIPLIER * mean_wait_tier)
-                      / SLA_THRESHOLD_SECONDS) ** 2
+        z = (max(0, worst_wait_tier - STARVATION_MULTIPLIER * mean_wait_tier)
+             / SLA_THRESHOLD_SECONDS) ** 2
+        starvation_term = -dt * sum over tier in {Gold, Bronze} of
+            w_tier * STARVATION_CAP * tanh(z / STARVATION_SATURATION_SCALE)
 
-    WHY THIS FORM. Every term in default_reward operates on an aggregate: the per-placement
+    BOUNDED, NOT LINEAR IN THE SQUARED EXCESS - FIXED AFTER A DIRECT SATURATION DIAGNOSIS.
+    An earlier version charged -STARVATION_WEIGHT*dt*w_tier*z with no ceiling. Tracing that
+    against the seed-1 smoke-test scenario (a Gold job stranded starting ~t=37,483s) showed
+    it saturates REWARD_SCALE=0.02's clip[-1,+1] on the FIRST sampled step past the
+    threshold, and stays there: 393 of 393 sampled starved steps sat at exactly -1.0, with
+    the underlying raw values ranging from -1,141.9 to -47,050.6 all mapping to the same
+    floor. Because z grows unboundedly the longer a job is neglected, no fixed linear weight
+    can fix this - a smaller weight only delays where saturation starts, it cannot prevent
+    it for the severe, persisting cases this term is specifically meant to punish hardest.
+
+    tanh(z/K), not tanh applied to the raw (unsquared) excess: tanh is concave from the
+    origin (steepest right at x=0, flattening immediately after), so applying it directly to
+    a linear excess would give the STRONGEST response right at the threshold and go nearly
+    flat almost immediately - the opposite of "escalating", and itself close to a step
+    function. Applying tanh to the SQUARED, already-normalised excess instead preserves the
+    original intent: for z well below STARVATION_SATURATION_SCALE, tanh(z/K) ~= z/K (tanh is
+    linear near 0), so the term stays approximately QUADRATIC in excess near the threshold -
+    a job 2x past the line still costs ~4x - and only bends toward the STARVATION_CAP
+    ceiling as z approaches K, rather than jumping there on the very first step past it.
+
+    Calibrated against the same seed-1 trace, not a hypothetical: observed z there ranged
+    ~1.35M-4.7M throughout the starved stretch. STARVATION_SATURATION_SCALE=3.7M puts the
+    smallest of those at tanh~=0.35 (clearly non-zero, clearly not yet saturated) and the
+    largest at tanh~=0.86 (clearly higher, genuinely escalating, still short of the
+    ceiling); a textbook mild case (500s excess, z~10,000, the old constant's own worked
+    example) gives tanh~=0.0027; a job stranded for nearly the whole episode (excess~40,000s,
+    z~64M) gives tanh~=1.0000, confirming the "decisively disqualify" ceiling still holds at
+    the extreme end - just reached smoothly, not as a step on the first starved sample.
+    STARVATION_CAP=3.0 is sized so a fully-saturated, dt=1, Gold-tier event lands at
+    GOLD_PRIORITY_WEIGHT*STARVATION_CAP=30 raw (0.6 once scaled) - strong, without
+    auto-clipping in isolation the way the unbounded version always did.
+
+    WHY THIS FORM (the underlying design, unchanged by the saturation fix). Every term in
+    default_reward operates on an aggregate: the per-placement
     credit is proportional to the wait of the specific job just placed, and the
     queue-holding cost is proportional to how many jobs are currently waiting - both are
     ultimately MEAN-shaped once summed over an episode (see default_reward's own docstring).
@@ -483,7 +564,9 @@ def phase_b_reward(env: "ClusterSchedulingEnv", info: dict) -> float:
         worst = info.get(f"worst_wait_{key}", 0.0)
         mean = info.get(f"mean_wait_{key}", 0.0)
         excess = max(0.0, worst - STARVATION_MULTIPLIER * mean)
-        penalty = -STARVATION_WEIGHT * dt * weight * (excess / SLA_THRESHOLD_SECONDS) ** 2
+        z = (excess / SLA_THRESHOLD_SECONDS) ** 2
+        saturation = float(np.tanh(z / STARVATION_SATURATION_SCALE))  # in [0, 1)
+        penalty = -dt * weight * STARVATION_CAP * saturation
         info["reward_components"][key] += penalty
         added += penalty
 
