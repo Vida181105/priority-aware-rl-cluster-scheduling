@@ -164,6 +164,29 @@ QUEUE_HOLD_FRACTION = 1.0
 GOLD_FRESHNESS_BONUS = 10.0
 GOLD_FRESHNESS_TAU = SLA_THRESHOLD_SECONDS
 
+# ----------------------------------------------------------------------------------
+# STARVATION-PREVENTION TERM (Phase B / Future Scope Step 5) - see phase_b_reward().
+# ----------------------------------------------------------------------------------
+# A job counts as starving once its current wait exceeds this many multiples of its OWN
+# TIER'S current mean wait - relative to what is normal for that tier right now, not a
+# fixed number of seconds. Gold and Bronze have very different typical wait magnitudes
+# (Gold is usually near-zero once the t=0 backlog clears; Bronze routinely runs into the
+# hundreds to low thousands from sheer volume), so a fixed-seconds threshold would need two
+# hand-tuned constants and would not transfer if the workload's scale changed; a multiple of
+# the tier's own current mean is scale-invariant and needs only one shared constant.
+STARVATION_MULTIPLIER = 5.0
+
+# Overall strength of the starvation penalty. A rough sanity check behind this starting
+# value: a Gold job stuck at 3,000 s while its tier's mean sits at 50 s gives an excess of
+# 3,000 - 5*50 = 2,750 s; in SLA-threshold units that is (2750/5)^2 = 302,500; weighted
+# 10x for Gold and scaled by this constant, that is one step's charge of roughly
+# 1e-4 * 10 * 302,500 = 302.5 - a genuinely painful one-off penalty comparable in order of
+# magnitude to the largest existing per-step charges (the t=0 queue-holding burst reaches
+# about -9.87), which is the intent: this term should stay at 0 for the vast majority of
+# steps and only bite hard on a genuine, persisting outlier. A first cut, not yet tuned
+# empirically the way QUEUE_HOLD_FRACTION and UTIL_WEIGHT were.
+STARVATION_WEIGHT = 1e-4
+
 # Episode ends once the clock passes max(arrival_time) + this buffer.
 EPISODE_BUFFER_SECONDS = 3600.0
 
@@ -387,6 +410,84 @@ def freshness_bonus_reward(env: "ClusterSchedulingEnv", info: dict) -> float:
         info["reward_components"]["gold"] += bonus
         reward += bonus
     return float(reward)
+
+
+def phase_b_reward(env: "ClusterSchedulingEnv", info: dict) -> float:
+    """
+    default_reward plus an explicit starvation-prevention term (Future Scope Step 5,
+    completing the originally-planned reward ablation study alongside freshness_bonus_reward
+    - this one is meant to be compared against default_reward ALONE, not stacked on top of
+    the freshness bonus; see multiseed_study.py --reward).
+
+    IN ONE SENTENCE: once a tier's single longest-waiting job has waited more than
+    STARVATION_MULTIPLIER times that tier's own current mean wait, the excess (in units of
+    the SLA threshold) is squared and charged every second it persists, weighted 10:1 toward
+    Gold like every other term in this reward.
+
+        starvation_term = -STARVATION_WEIGHT * dt * sum over tier in {Gold, Bronze} of
+            w_tier * (max(0, worst_wait_tier - STARVATION_MULTIPLIER * mean_wait_tier)
+                      / SLA_THRESHOLD_SECONDS) ** 2
+
+    WHY THIS FORM. Every term in default_reward operates on an aggregate: the per-placement
+    credit is proportional to the wait of the specific job just placed, and the
+    queue-holding cost is proportional to how many jobs are currently waiting - both are
+    ultimately MEAN-shaped once summed over an episode (see default_reward's own docstring).
+    A policy can therefore starve one single job for thousands of seconds while clearing
+    everything else quickly and still show an excellent mean, because the mean divides that
+    one outlier's cost across every other, fast-served job in the tier - literally the
+    failure mode this term exists to catch.
+
+    Two choices address that directly:
+      - RELATIVE threshold (STARVATION_MULTIPLIER x the tier's own current mean), not a
+        fixed number of seconds. Gold and Bronze have very different typical wait scales
+        (Gold near-zero once the t=0 backlog clears, Bronze routinely in the hundreds to low
+        thousands from volume alone), so a fixed-seconds threshold would need two
+        hand-tuned, workload-specific constants; a multiple of the tier's own current mean
+        is scale-invariant and needs only one shared constant, and it operationalises
+        exactly the phrase "waited extremely long while the average still looks fine" - it
+        IS a comparison against that average.
+      - SQUARED excess, not linear. The existing terms are all linear in wait, which is
+        correct for optimising a mean (each second of delay costs the same). A starvation
+        penalty should not be flat: a job 2x past the starvation line should cost more than
+        2x a job barely past it, so the pressure to rescue a badly starved job keeps
+        increasing the longer it is left rather than staying constant. Squaring is the
+        simplest function with that property.
+
+    This is a FLOW cost like queue_term (scaled by dt, charged every step a job remains
+    starving), not a placement-time credit - the whole point is to give the agent a live,
+    escalating incentive to go rescue a specific neglected job WHILE it is still waiting,
+    not only a reward after the fact.
+
+    worst_wait_tier/mean_wait_tier are captured by step() BEFORE this step's placement, the
+    same convention n_waiting_gold/n_waiting_bronze already use: they describe the state
+    that was true during the interval this step's dt charges for. Placing the tier's
+    worst-waiting job therefore stops this charge starting the very next step, once that job
+    drops out of the waiting queue and a new, typically much smaller, worst wait takes over.
+
+    Folded into the existing "gold"/"bronze" components of info["reward_components"] (split
+    by which tier's excess fired) rather than added as a new component key, mirroring
+    freshness_bonus_reward exactly - this keeps every existing training/logging code path
+    (dqn_agent.py's TrainingLog, the R_gold/R_bronze columns, multiseed_study.py) unchanged
+    and working, with no risk of a missing-key error from a component the logger does not
+    know about.
+
+    Swap this out by passing phase_b_reward as `reward_fn`; see multiseed_study.py --reward.
+    """
+    reward = default_reward(env, info)
+    dt = info.get("dt", 0.0)
+    if dt <= 0.0:
+        return float(reward)
+
+    added = 0.0
+    for key, weight in (("gold", GOLD_PRIORITY_WEIGHT), ("bronze", BRONZE_PRIORITY_WEIGHT)):
+        worst = info.get(f"worst_wait_{key}", 0.0)
+        mean = info.get(f"mean_wait_{key}", 0.0)
+        excess = max(0.0, worst - STARVATION_MULTIPLIER * mean)
+        penalty = -STARVATION_WEIGHT * dt * weight * (excess / SLA_THRESHOLD_SECONDS) ** 2
+        info["reward_components"][key] += penalty
+        added += penalty
+
+    return float(reward + added)
 
 
 def queue_delay_reward(env: "ClusterSchedulingEnv", info: dict) -> float:
@@ -818,6 +919,21 @@ class ClusterSchedulingEnv(gym.Env):
             return 0.0
         return max(0.0, self.now - self._wait_arrival_sum[gold] / count)
 
+    def _tier_worst_wait(self, gold: bool) -> float:
+        """
+        Current wait of the single longest-waiting job in one tier, or 0.0 if none is
+        waiting. _front returns an arrival-ordered, lazily-deleted queue, so its first live
+        entry is the oldest arrival still waiting - i.e. the worst current wait - using the
+        same O(1)-amortised head-pointer mechanism visible_jobs() already relies on, just
+        asked for 1 element instead of K. Surfaced into `info` by step() as
+        "worst_wait_gold"/"worst_wait_bronze"; used by phase_b_reward(), ignored by
+        default_reward.
+        """
+        queue = self._waiting_gold if gold else self._waiting_bronze
+        head_attr = "_head_gold" if gold else "_head_bronze"
+        front = self._front(queue, head_attr, 1)
+        return self.jobs[front[0]].scheduling_delay(self.now) if front else 0.0
+
     def _scaled_wait(self, seconds: float) -> float:
         """
         Compress a waiting time into a network-friendly range.
@@ -896,6 +1012,17 @@ class ClusterSchedulingEnv(gym.Env):
         t_before = self.now
         n_waiting_gold_before = self._wait_count[True]
         n_waiting_bronze_before = self._wait_count[False]
+        # Captured BEFORE this step's placement/clock-advance, same convention as the
+        # n_waiting_*_before pair above: these describe the state that was true DURING the
+        # dt interval this step is about to charge, not the state after it changed. Placing
+        # the tier's worst-waiting job this step correctly stops the starvation charge on
+        # the very next step (it drops out of _waiting_gold/_waiting_bronze once placed, so
+        # a new, typically much smaller, worst wait takes its place) rather than the credit
+        # and the escalating penalty both firing for the same instant.
+        worst_wait_gold_before = self._tier_worst_wait(True)
+        worst_wait_bronze_before = self._tier_worst_wait(False)
+        mean_wait_gold_before = self._mean_wait(True)
+        mean_wait_bronze_before = self._mean_wait(False)
 
         visible = self.visible_jobs()
         scheduled_ok = False
@@ -940,6 +1067,11 @@ class ClusterSchedulingEnv(gym.Env):
                      "dt": self.now - t_before,
                      "n_waiting_gold": n_waiting_gold_before,
                      "n_waiting_bronze": n_waiting_bronze_before,
+                     # For phase_b_reward's starvation term; default_reward ignores these.
+                     "worst_wait_gold": worst_wait_gold_before,
+                     "worst_wait_bronze": worst_wait_bronze_before,
+                     "mean_wait_gold": mean_wait_gold_before,
+                     "mean_wait_bronze": mean_wait_bronze_before,
                      # Wait accumulated by the job placed this step, for the per-placement
                      # delay term in default_reward.
                      "placed_wait": (self.jobs[placed_idx].scheduled_time

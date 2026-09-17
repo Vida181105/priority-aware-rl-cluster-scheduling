@@ -26,6 +26,17 @@ every output into its own subdirectory, results/csv/multiseed/<reward>/ and
 models/<reward>/, so it can NEVER collide with or overwrite Step 1's default-reward files,
 which remain exactly where they are at the top level of results/csv/multiseed/.
 
+STEP 5 - PHASE B / STARVATION-PREVENTION REWARD. --reward phase_b adds
+environment.phase_b_reward's explicit starvation term to default_reward (see that
+function's docstring for the exact formula and reasoning) - a squared penalty once a
+tier's single longest-waiting job exceeds STARVATION_MULTIPLIER x that tier's own current
+mean wait, targeting the specific failure mode the mean-delay terms cannot see: one job
+starved for a very long time while the tier's average still looks fine. Per the same
+one-variable-at-a-time discipline as every other step here, this is meant to be compared
+against --reward default ALONE (results/csv/multiseed/phase_b/) - not stacked on top of
+freshness_bonus. If Phase B helps on its own, freshness_bonus + phase_b together is a
+natural follow-up, not part of this step.
+
 STEP 3 - ACCUMULATING AGGREGATE STATS ACROSS SEPARATE INVOCATIONS. The aggregate table
 (multiseed_aggregate_stats.csv) and the per-seed summary (multiseed_per_seed_summary.csv)
 are DERIVED files, rebuilt on every run from every dqn_evaluation_seed*.csv actually present
@@ -61,6 +72,8 @@ Run:
     python3 src/multiseed_study.py --reward freshness_bonus               # Step 2: same 5 seeds, freshness bonus
     python3 src/multiseed_study.py --reward freshness_bonus --seeds 0 1 --episodes 3  # Step 2 smoke test
     python3 src/multiseed_study.py --seeds 5 6 7 8 9                      # Step 3: extends seeds 0-4 to 0-9
+    python3 src/multiseed_study.py --reward phase_b                      # Step 5: same 5 seeds, starvation-aware reward
+    python3 src/multiseed_study.py --reward phase_b --seeds 0 1 --episodes 3  # Step 5 smoke test
     python3 src/multiseed_study.py --replay prioritized                  # Step 4: same 5 seeds, prioritized replay
     python3 src/multiseed_study.py --replay prioritized --seeds 0 1 --episodes 3  # Step 4 smoke test
 """
@@ -78,7 +91,8 @@ import pandas as pd
 
 from dqn_agent import (EVAL_EVERY, DQNAgent, PrioritizedReplayBuffer, ReplayBuffer, evaluate,
                        sanity_checks, train)
-from environment import CSV_DIR, MODEL_DIR, default_reward, ensure_output_dirs, freshness_bonus_reward
+from environment import (CSV_DIR, MODEL_DIR, default_reward, ensure_output_dirs,
+                         freshness_bonus_reward, phase_b_reward)
 
 MULTISEED_CSV_DIR = CSV_DIR / "multiseed"
 
@@ -98,6 +112,7 @@ def _display_path(p: Path) -> str:
 REWARD_VARIANTS = {
     "default": default_reward,
     "freshness_bonus": freshness_bonus_reward,
+    "phase_b": phase_b_reward,
 }
 
 # Name -> replay buffer class. "uniform" maps to the existing ReplayBuffer, so a run with

@@ -47,7 +47,8 @@ import pandas as pd
 from baselines import (FCFSScheduler, ResourceReservationScheduler, RoundRobinScheduler,
                        StaticPriorityScheduler, run_episode)
 from environment import (BRONZE_PRIORITY_WEIGHT, CSV_DIR, ClusterSchedulingEnv,
-                         GOLD_PRIORITY_WEIGHT, MODEL_DIR, PLOT_DIR, ensure_output_dirs)
+                         GOLD_PRIORITY_WEIGHT, MODEL_DIR, PLOT_DIR, SLA_THRESHOLD_SECONDS,
+                         STARVATION_MULTIPLIER, ensure_output_dirs)
 
 # ----------------------------------------------------------------------------------
 # HYPERPARAMETERS
@@ -555,20 +556,75 @@ def late_gold_delay(env: ClusterSchedulingEnv) -> float:
     return float(np.mean(vals))
 
 
+
+# Weight on SELECTION_SCORE's starvation term. Reverse-engineered the same way
+# STARVATION_WEIGHT was in environment.py, to a comparable target scale rather than picked
+# arbitrarily:
+#   MODERATE case - worst_gold_wait 500 s past the starvation line (5x a 500 s mean, so
+#   worst~3,000 s): excess=500, in SLA-threshold units 500/5=100, squared=10,000. Weighted
+#   10x for Gold: 0.005 * 10 * 10,000 = 500 - the same order of magnitude as a typical
+#   gold_delay/bronze_wait/late_gold reading (hundreds to low thousands), so a mild
+#   starvation event nudges the ranking without swamping it.
+#   SEVERE case - a job essentially abandoned for the episode (worst_gold_wait ~44,000 s
+#   against the same 500 s mean): excess~41,500, in-units~8,300, squared~69,000,000,
+#   weighted: 0.005 * 10 * 69,000,000 ~= 3.45 million - large enough to decisively rule
+#   the checkpoint out ahead of every other consideration, which is the intent: this
+#   specific failure (one job stranded for nearly the whole episode) is the pathology
+#   Phase B exists to make unacceptable, and it should not be out-voted by an otherwise
+#   good mean.
+SELECTION_STARVATION_WEIGHT = 0.005
+
+
 def SELECTION_SCORE(ev: dict) -> float:
     """
     Model-selection score, lower is better. Mirrors the reward's own priorities:
 
         10 * mean_gold_delay + 1 * mean_bronze_delay + 1 * late_gold_avg_delay
+        + SELECTION_STARVATION_WEIGHT * sum over tier in {Gold, Bronze} of
+              w_tier * (max(0, worst_tier_wait - STARVATION_MULTIPLIER * mean_tier_delay)
+                        / SLA_THRESHOLD_SECONDS) ** 2
 
-    Both metrics already charge unscheduled jobs their censored wait, so a policy that
-    abandons work is penalised automatically rather than needing a separate term. Using
-    gold delay alone would have selected the previous run's episode 20 - its best gold
-    delay (810.5 s) came with Bronze collapsing to 5,108 s and 4,188 jobs unscheduled.
+    Both mean-delay metrics already charge unscheduled jobs their censored wait, so a
+    policy that abandons work broadly is penalised automatically rather than needing a
+    separate term. Using gold delay alone would have selected the previous run's episode
+    20 - its best gold delay (810.5 s) came with Bronze collapsing to 5,108 s and 4,188
+    jobs unscheduled.
+
+    THE STARVATION TERM CLOSES A REMAINING GAP: late_gold only covers the 20 late-arriving
+    Gold jobs, so a score built from gold_delay/bronze_wait/late_gold alone is blind to a
+    starved Bronze job (no cohort tracking exists for Bronze at all) and to a starved
+    t=0-backlog Gold job outside that cohort - exactly what the prioritized-replay seed 0
+    investigation found: late_gold=20/20 perfect while n_gold_unscheduled=1, a stranded job
+    the late-cohort metric cannot see. It reuses the EXACT SAME worst_wait_tier concept
+    phase_b_reward computes per step (see that function and greedy_eval's worst_gold_wait/
+    worst_bronze_wait docstring) - not a second, independently-invented notion of
+    starvation - just evaluated once per checkpoint via the episode's worst sampled value
+    and its overall mean, rather than continuously during training.
+
+    BACKWARD COMPATIBLE BY CONSTRUCTION, NOT JUST BY DEFAULT: `ev.get(..., 0.0)` means an
+    `ev` dict without worst_gold_wait/worst_bronze_wait (i.e. produced by the OLD
+    greedy_eval, before this change) scores a starvation term of exactly 0, reproducing the
+    old formula precisely. But this is moot for every already-completed run: SELECTION_SCORE
+    is only ever called live, inside a running train() call's checkpoint loop (see the three
+    call sites in this file) - never retroactively against a saved dqn_greedy_checkpoints_
+    seed*.csv. The default/prioritized/freshness_bonus results already on disk had their
+    checkpoint selection decided and their weights saved when THEIR train() calls ran, which
+    already happened; nothing here can reach back and redo that decision. This formula only
+    takes effect the next time train() actually runs - Phase B's training run, or any future
+    re-run of an earlier variant.
     """
+    gold_excess = max(0.0, ev.get("worst_gold_wait", 0.0)
+                      - STARVATION_MULTIPLIER * ev["gold_delay"])
+    bronze_excess = max(0.0, ev.get("worst_bronze_wait", 0.0)
+                        - STARVATION_MULTIPLIER * ev["bronze_wait"])
+    starvation = SELECTION_STARVATION_WEIGHT * (
+        GOLD_PRIORITY_WEIGHT * (gold_excess / SLA_THRESHOLD_SECONDS) ** 2
+        + BRONZE_PRIORITY_WEIGHT * (bronze_excess / SLA_THRESHOLD_SECONDS) ** 2)
+
     return (GOLD_PRIORITY_WEIGHT * ev["gold_delay"]
             + BRONZE_PRIORITY_WEIGHT * ev["bronze_wait"]
-            + ev["late_gold"])
+            + ev["late_gold"]
+            + starvation)
 
 
 def greedy_eval(agent: "DQNAgent", seed: int = 0) -> dict:
@@ -580,6 +636,22 @@ def greedy_eval(agent: "DQNAgent", seed: int = 0) -> dict:
     unplaceable job and burn every step on a failed placement, which merely advances the
     clock. Exploration hides that failure mode during training (place_fail was 0 there),
     so it is only visible with epsilon switched off.
+
+    worst_gold_wait/worst_bronze_wait: the highest value env._tier_worst_wait(gold) ever
+    took during this episode, per tier - the SAME per-step quantity phase_b_reward samples
+    every step to compute its starvation term (see that function's docstring), just
+    aggregated here via max() over the whole episode instead of being charged into a
+    return. This is what closes the SELECTION_SCORE gap flagged in the Phase B report:
+    late_gold only sees the 20 late-arriving Gold jobs, so it is blind to a starved Bronze
+    job (no cohort tracking exists for Bronze at all) and to a starved t=0-backlog Gold job
+    outside that cohort - exactly what the prioritized-replay seed 0 investigation found
+    (late_gold=20/20 perfect while n_gold_unscheduled=1, a stranded job late_gold cannot
+    detect). Tracking the tier-wide worst wait directly, rather than only a fixed cohort,
+    covers both gaps without inventing a second notion of starvation alongside the reward's.
+
+    Cost: env._tier_worst_wait is O(1) amortised (same head-pointer mechanism
+    visible_jobs() already relies on - see environment.py), so two extra calls per step add
+    no meaningful overhead to an episode that already does far more work than this per step.
     """
     was_greedy = agent.greedy
     agent.greedy = True
@@ -588,6 +660,8 @@ def greedy_eval(agent: "DQNAgent", seed: int = 0) -> dict:
         obs, info = env.reset(seed=seed)
         mask = info["action_mask"]
         c = {"place_ok": 0, "place_fail": 0, "noop": 0}
+        worst_gold_wait = 0.0
+        worst_bronze_wait = 0.0
 
         for _ in range(env.max_steps):
             action = agent.act(obs, mask)
@@ -602,6 +676,9 @@ def greedy_eval(agent: "DQNAgent", seed: int = 0) -> dict:
             else:
                 c["place_fail"] += 1
 
+            worst_gold_wait = max(worst_gold_wait, env._tier_worst_wait(True))
+            worst_bronze_wait = max(worst_bronze_wait, env._tier_worst_wait(False))
+
             if terminated or truncated:
                 break
 
@@ -610,6 +687,8 @@ def greedy_eval(agent: "DQNAgent", seed: int = 0) -> dict:
                 "bronze_wait": m["bronze_avg_waiting_time"],
                 "late_gold": late_gold_delay(env),
                 "unscheduled": m["n_unscheduled"],
+                "worst_gold_wait": worst_gold_wait,
+                "worst_bronze_wait": worst_bronze_wait,
                 "steps": m["steps"], **c}
     finally:
         agent.greedy = was_greedy
