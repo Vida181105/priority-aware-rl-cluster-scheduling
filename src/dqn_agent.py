@@ -559,7 +559,7 @@ def SELECTION_SCORE(ev: dict) -> float:
     """
     Model-selection score, lower is better. Mirrors the reward's own priorities:
 
-        10 * mean_gold_delay + 1 * mean_bronze_delay
+        10 * mean_gold_delay + 1 * mean_bronze_delay + 1 * late_gold_avg_delay
 
     Both metrics already charge unscheduled jobs their censored wait, so a policy that
     abandons work is penalised automatically rather than needing a separate term. Using
@@ -567,7 +567,8 @@ def SELECTION_SCORE(ev: dict) -> float:
     delay (810.5 s) came with Bronze collapsing to 5,108 s and 4,188 jobs unscheduled.
     """
     return (GOLD_PRIORITY_WEIGHT * ev["gold_delay"]
-            + BRONZE_PRIORITY_WEIGHT * ev["bronze_wait"])
+            + BRONZE_PRIORITY_WEIGHT * ev["bronze_wait"]
+            + ev["late_gold"])
 
 
 def greedy_eval(agent: "DQNAgent", seed: int = 0) -> dict:
