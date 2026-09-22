@@ -48,7 +48,8 @@ from baselines import (FCFSScheduler, ResourceReservationScheduler, RoundRobinSc
                        StaticPriorityScheduler, run_episode)
 from environment import (BRONZE_PRIORITY_WEIGHT, CSV_DIR, ClusterSchedulingEnv,
                          GOLD_PRIORITY_WEIGHT, MODEL_DIR, PLOT_DIR, SLA_THRESHOLD_SECONDS,
-                         STARVATION_MULTIPLIER, ensure_output_dirs)
+                         STARVATION_CAP, STARVATION_MULTIPLIER, STARVATION_SATURATION_SCALE,
+                         ensure_output_dirs)
 
 # ----------------------------------------------------------------------------------
 # HYPERPARAMETERS
@@ -557,21 +558,26 @@ def late_gold_delay(env: ClusterSchedulingEnv) -> float:
 
 
 
-# Weight on SELECTION_SCORE's starvation term. Reverse-engineered the same way
-# STARVATION_WEIGHT was in environment.py, to a comparable target scale rather than picked
-# arbitrarily:
-#   MODERATE case - worst_gold_wait 500 s past the starvation line (5x a 500 s mean, so
-#   worst~3,000 s): excess=500, in SLA-threshold units 500/5=100, squared=10,000. Weighted
-#   10x for Gold: 0.005 * 10 * 10,000 = 500 - the same order of magnitude as a typical
-#   gold_delay/bronze_wait/late_gold reading (hundreds to low thousands), so a mild
-#   starvation event nudges the ranking without swamping it.
-#   SEVERE case - a job essentially abandoned for the episode (worst_gold_wait ~44,000 s
-#   against the same 500 s mean): excess~41,500, in-units~8,300, squared~69,000,000,
-#   weighted: 0.005 * 10 * 69,000,000 ~= 3.45 million - large enough to decisively rule
-#   the checkpoint out ahead of every other consideration, which is the intent: this
-#   specific failure (one job stranded for nearly the whole episode) is the pathology
-#   Phase B exists to make unacceptable, and it should not be out-voted by an otherwise
-#   good mean.
+# SUPERSEDED - no longer used by SELECTION_SCORE. This was the weight on an UNBOUNDED
+# excess^2 starvation term (starvation = SELECTION_STARVATION_WEIGHT * w_tier * excess^2),
+# picked (see the sanity check this comment used to show) to land in the hundreds for a
+# moderate case and the millions for a severe one - which is exactly the problem: it grows
+# without limit exactly like phase_b_reward's own original, pre-fix starvation term did
+# (see STARVATION_WEIGHT above), and it was never updated when that term was bounded.
+#
+# CONFIRMED BUG, not a hypothetical: this mismatch meant selection and training were
+# judging checkpoints by DIFFERENT standards. Directly observed in the real 10-seed Phase B
+# run (results/csv/multiseed/phase_b/) - seed 7's checkpoint history has FIVE checkpoints
+# with 0 unscheduled jobs (episodes 1, 5, 10, 35, 40), yet this formula selected episode 30,
+# which left 29,083 jobs unscheduled, because episode 30's unbounded excess^2 term happened
+# to be smaller in this particular case than some of the healthy checkpoints' own (also
+# unbounded, also occasionally huge) starvation terms - an artifact of two runaway
+# quantities being compared, not a meaningful ranking. Replaced below by the exact same
+# bounded tanh(z/STARVATION_SATURATION_SCALE) form phase_b_reward() uses, imported directly
+# from environment.py rather than re-derived, so selection and training can never drift
+# apart like this again. Kept defined, unused, as a record of the superseded design - this
+# project's established practice (see STARVATION_WEIGHT, queue_delay_reward,
+# sla_penalty_reward).
 SELECTION_STARVATION_WEIGHT = 0.005
 
 
@@ -580,8 +586,10 @@ def SELECTION_SCORE(ev: dict) -> float:
     Model-selection score, lower is better. Mirrors the reward's own priorities:
 
         10 * mean_gold_delay + 1 * mean_bronze_delay + 1 * late_gold_avg_delay
-        + SELECTION_STARVATION_WEIGHT * sum over tier in {Gold, Bronze} of
-              w_tier * (max(0, worst_tier_wait - STARVATION_MULTIPLIER * mean_tier_delay)
+        + sum over tier in {Gold, Bronze} of
+              w_tier * STARVATION_CAP * tanh(z_tier / STARVATION_SATURATION_SCALE)
+
+        where z_tier = (max(0, worst_tier_wait - STARVATION_MULTIPLIER * mean_tier_delay)
                         / SLA_THRESHOLD_SECONDS) ** 2
 
     Both mean-delay metrics already charge unscheduled jobs their censored wait, so a
@@ -601,25 +609,40 @@ def SELECTION_SCORE(ev: dict) -> float:
     starvation - just evaluated once per checkpoint via the episode's worst sampled value
     and its overall mean, rather than continuously during training.
 
+    BOUNDED, IMPORTED DIRECTLY FROM environment.py, NOT RE-DERIVED - fixing a confirmed bug.
+    The starvation term here used to be SELECTION_STARVATION_WEIGHT * z_tier: unbounded, and
+    NOT the same formula phase_b_reward() actually trains against (that term was bounded by
+    a saturating tanh after its own saturation diagnosis - see STARVATION_CAP/
+    STARVATION_SATURATION_SCALE in environment.py). Selection and training were judging
+    checkpoints by different standards. Confirmed directly against the real 10-seed Phase B
+    run: seed 7 has five checkpoints with 0 unscheduled jobs (episodes 1, 5, 10, 35, 40), but
+    the old unbounded formula selected episode 30 - 29,083 unscheduled - because its
+    excess^2 term happened to be smaller than some of the healthy checkpoints' own
+    (also-unbounded) starvation terms, an artifact of comparing two runaway quantities
+    rather than a meaningful ranking. STARVATION_CAP and STARVATION_SATURATION_SCALE are
+    imported directly from environment.py (not separately defined constants here) precisely
+    so this cannot drift out of sync with the reward again.
+
     BACKWARD COMPATIBLE BY CONSTRUCTION, NOT JUST BY DEFAULT: `ev.get(..., 0.0)` means an
     `ev` dict without worst_gold_wait/worst_bronze_wait (i.e. produced by the OLD
-    greedy_eval, before this change) scores a starvation term of exactly 0, reproducing the
-    old formula precisely. But this is moot for every already-completed run: SELECTION_SCORE
-    is only ever called live, inside a running train() call's checkpoint loop (see the three
-    call sites in this file) - never retroactively against a saved dqn_greedy_checkpoints_
-    seed*.csv. The default/prioritized/freshness_bonus results already on disk had their
-    checkpoint selection decided and their weights saved when THEIR train() calls ran, which
+    greedy_eval, before that change) scores a starvation term of tanh(0)=0, reproducing the
+    pre-starvation-tracking formula precisely. But this is moot for every already-completed
+    run: SELECTION_SCORE is only ever called live, inside a running train() call's
+    checkpoint loop (see the three call sites in this file) - never retroactively against a
+    saved dqn_greedy_checkpoints_seed*.csv. Every result already on disk had its checkpoint
+    selection decided and its weights saved when THAT run's train() call executed, which
     already happened; nothing here can reach back and redo that decision. This formula only
-    takes effect the next time train() actually runs - Phase B's training run, or any future
-    re-run of an earlier variant.
+    takes effect the next time train() actually runs.
     """
     gold_excess = max(0.0, ev.get("worst_gold_wait", 0.0)
                       - STARVATION_MULTIPLIER * ev["gold_delay"])
     bronze_excess = max(0.0, ev.get("worst_bronze_wait", 0.0)
                         - STARVATION_MULTIPLIER * ev["bronze_wait"])
-    starvation = SELECTION_STARVATION_WEIGHT * (
-        GOLD_PRIORITY_WEIGHT * (gold_excess / SLA_THRESHOLD_SECONDS) ** 2
-        + BRONZE_PRIORITY_WEIGHT * (bronze_excess / SLA_THRESHOLD_SECONDS) ** 2)
+    gold_z = (gold_excess / SLA_THRESHOLD_SECONDS) ** 2
+    bronze_z = (bronze_excess / SLA_THRESHOLD_SECONDS) ** 2
+    starvation = STARVATION_CAP * (
+        GOLD_PRIORITY_WEIGHT * np.tanh(gold_z / STARVATION_SATURATION_SCALE)
+        + BRONZE_PRIORITY_WEIGHT * np.tanh(bronze_z / STARVATION_SATURATION_SCALE))
 
     return (GOLD_PRIORITY_WEIGHT * ev["gold_delay"]
             + BRONZE_PRIORITY_WEIGHT * ev["bronze_wait"]
